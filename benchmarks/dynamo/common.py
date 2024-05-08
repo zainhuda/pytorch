@@ -1165,6 +1165,7 @@ class AOTInductorModelCache:
                 example_args,
                 example_kwargs,
                 pre_dispatch=True,
+                strict=False,
             ).module()
             with torch.no_grad():
                 so_path = torch._inductor.aot_compile(
