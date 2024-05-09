@@ -797,7 +797,7 @@ def _advise_is_size(a):
         and isinstance(a.node.expr, sympy.Symbol)
         and a.node.shape_env.is_unbacked_symint(a.node.expr)
     ):
-        _constrain_range_for_size(a)
+        torch.ops.aten.sym_constrain_range_for_size.default(a)
 
 def _constrain_range_for_size(a, min: Optional[int] = None, max: Optional[int] = None):
     """
