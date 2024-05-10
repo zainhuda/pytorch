@@ -2,8 +2,10 @@
 
 #include <c10/util/intrusive_ptr.h>
 #include <c10/util/string_view.h>
+#include <torch/csrc/distributed/c10d/Collectives.hpp>
 #include <torch/csrc/distributed/c10d/FileStore.hpp>
 #include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
+#include <torch/csrc/distributed/c10d/StoreCollectives.hpp>
 #include <torch/csrc/distributed/c10d/TCPStore.hpp>
 #include <torch/csrc/distributed/c10d/Utils.hpp>
 #ifndef _WIN32
@@ -1486,6 +1488,195 @@ Arguments:
           "_underlying_non_prefix_store",
           &::c10d::PrefixStore::getUnderlyingNonPrefixStore,
           R"(Recursively to get the store before layers of wrapping with PrefixStore.)");
+
+  using namespace std::chrono_literals;
+
+  auto collectives =
+      py::class_<::c10d::Collectives, c10::intrusive_ptr<::c10d::Collectives>>(
+          module,
+          "Collectives",
+          R"(
+Base class for all Collectives implementations.
+)")
+          .def(
+              "barrier",
+              &::c10d::Collectives::barrier,
+              py::call_guard<py::gil_scoped_release>(),
+              R"(
+Blocks until all workers have entered this function.
+
+Arguments:
+    prefix (str): The unique key used to identify this operation.
+    timeout (duration): The timeout for this operation.
+    block (bool): whether to block this working waiting on the results of the barrier.
+)")
+          .def(
+              "all_sum",
+              &::c10d::Collectives::all_sum,
+              py::call_guard<py::gil_scoped_release>(),
+              R"(
+Computes a sum across all workers and returns the final value.
+
+Arguments:
+    prefix (str): The unique key used to identify this operation.
+    data (int): The data to sum.
+    timeout (duration): The timeout for this operation.
+)")
+          .def(
+              "broadcast_send",
+              [](::c10d::Collectives& collectives,
+                 const std::string& prefix,
+                 const std::string& data,
+                 std::chrono::milliseconds timeout = 5min) {
+                std::vector<uint8_t> data_(data.begin(), data.end());
+                collectives.broadcast_send(prefix, data_, timeout);
+              },
+              py::call_guard<py::gil_scoped_release>(),
+              R"(
+Sends data to all other workers. Must be only called from one worker.
+
+Arguments:
+    prefix (str): The unique key used to identify this operation.
+    data (str): The data to send.
+    timeout (duration): The timeout for this operation.
+)")
+          .def(
+              "broadcast_recv",
+              [](::c10d::Collectives& collectives,
+                 const std::string& prefix,
+                 std::chrono::milliseconds timeout = 5min) {
+                std::vector<uint8_t> out =
+                    collectives.broadcast_recv(prefix, timeout);
+                return std::string{out.begin(), out.end()};
+              },
+              py::call_guard<py::gil_scoped_release>(),
+              R"(
+Receives data broadcasted from 1 worker.
+
+Arguments:
+    prefix (str): The unique key used to identify this operation.
+    timeout (duration): The timeout for this operation.
+)")
+          .def(
+              "gather_send",
+              [](::c10d::Collectives& collectives,
+                 const std::string& prefix,
+                 const std::string& data,
+                 std::chrono::milliseconds timeout = 5min) {
+                std::vector<uint8_t> data_(data.begin(), data.end());
+                collectives.gather_send(prefix, data_, timeout);
+              },
+              py::call_guard<py::gil_scoped_release>(),
+              R"(
+Sends data to one other worker.
+
+Arguments:
+    prefix (str): The unique key used to identify this operation.
+    data (str): The data to send.
+    timeout (duration): The timeout for this operation.
+)")
+          .def(
+              "gather_recv",
+              [](::c10d::Collectives& collectives,
+                 const std::string& prefix,
+                 const std::string& data,
+                 std::chrono::milliseconds timeout = 5min) {
+                std::vector<uint8_t> data_(data.begin(), data.end());
+                std::vector<std::vector<uint8_t>> out =
+                    collectives.gather_recv(prefix, data_, timeout);
+
+                std::vector<std::string> out_;
+                for (const auto& v : out) {
+                  out_.emplace_back(v.begin(), v.end());
+                }
+                return out_;
+              },
+              py::call_guard<py::gil_scoped_release>(),
+              R"(
+Receives data broadcasted from all workers. Must only be called by one worker.
+
+Arguments:
+    prefix (str): The unique key used to identify this operation.
+    timeout (duration): The timeout for this operation.
+)")
+
+          .def(
+              "scatter_send",
+              [](::c10d::Collectives& collectives,
+                 const std::string& prefix,
+                 const std::vector<std::string>& data,
+                 std::chrono::milliseconds timeout = 5min) {
+                std::vector<std::vector<uint8_t>> data_;
+                for (const auto& v : data) {
+                  data_.emplace_back(v.begin(), v.end());
+                }
+                auto out = collectives.scatter_send(prefix, data_, timeout);
+                return std::string{out.begin(), out.end()};
+              },
+              py::call_guard<py::gil_scoped_release>(),
+              R"(
+Sends rank specific data to all other workers.
+
+Arguments:
+    prefix (str): The unique key used to identify this operation.
+    data (str): The data to send.
+    timeout (duration): The timeout for this operation.
+)")
+          .def(
+              "scatter_recv",
+              [](::c10d::Collectives& collectives,
+                 const std::string& prefix,
+                 std::chrono::milliseconds timeout = 5min) {
+                std::vector<uint8_t> out =
+                    collectives.scatter_recv(prefix, timeout);
+
+                return std::string{out.begin(), out.end()};
+              },
+              py::call_guard<py::gil_scoped_release>(),
+              R"(
+Receives rank specific data from one worker.
+
+Arguments:
+    prefix (str): The unique key used to identify this operation.
+    timeout (duration): The timeout for this operation.
+)")
+
+          .def(
+              "all_gather",
+              [](::c10d::Collectives& collectives,
+                 const std::string& prefix,
+                 const std::string& data,
+                 std::chrono::milliseconds timeout = 5min) {
+                std::vector<uint8_t> data_{data.begin(), data.end()};
+                std::vector<std::vector<uint8_t>> out =
+                    collectives.all_gather(prefix, data_, timeout);
+
+                std::vector<std::string> out_;
+                for (const auto& v : out) {
+                  out_.emplace_back(v.begin(), v.end());
+                }
+
+                return out_;
+              },
+              py::call_guard<py::gil_scoped_release>(),
+              R"(
+Sends data to all workers and receives data from all other workers.
+
+Arguments:
+    prefix (str): The unique key used to identify this operation.
+    data (str): The data to send.
+    timeout (duration): The timeout for this operation.
+)");
+
+  intrusive_ptr_class_<::c10d::StoreCollectives>(
+      module,
+      "StoreCollectives",
+      collectives,
+      R"(
+An implementation of Collectives that uses the provided store as the underlying
+communication mechanism.
+      )")
+      .def(py::init<c10::intrusive_ptr<::c10d::Store>, int, int>());
 
   auto processGroup =
       py::class_<
