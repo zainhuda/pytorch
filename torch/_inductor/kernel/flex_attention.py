@@ -2,6 +2,7 @@
 
 import logging
 import math
+from enum import auto, Enum
 from typing import Any, List, Tuple
 
 import torch
@@ -24,6 +25,14 @@ log = logging.getLogger(__name__)
 aten = torch.ops.aten
 
 
+class SubgraphType(Enum):
+    """The type of subgraph to build the buffer for"""
+
+    FWD = auto()  # Forward pass
+    JOINT_FWD = auto()  # The recompute step fo the BWD
+    JOINT_BWD = auto()  # The bwd pass of the joint
+
+
 def flex_attention_grid(batch_size, num_heads, num_queries, d_model, meta):
     """How is this kernel parallelized?
     We create a grid of (batch_size * num_heads, ceil_div(n_queries, query_block_size), 1)
@@ -43,11 +52,37 @@ def create_placeholder(
     return TensorBox.create(input_buffer)
 
 
+def index_to_other_buffers(cnt: int, graph_type: SubgraphType) -> int:
+    """This function needs to be aware of the signatures for flex_attention_forward
+    and flex_attention_backward. If new args are added, or the signature changes
+    be sure to update the indexing math
+
+    Args:
+        cnt (int): The current index of the placeholder node
+        is_joint_graph (bool): Whether or not this subgraph represents the joint graph
+    """
+    # Current fwd_args = [query, key, value, score_mod, *other_buffers]
+    # For fwd_graphs we have 5 dummy values this when the first lifted args
+    # is seen cnt = 5 and the start of the index_buffers is at args[4]
+    # thus we subtract 1 from the current cnt
+    if graph_type == SubgraphType.FWD:
+        return cnt - 1
+
+    # Current bwd_args = [q, k, v, out, lse, grad_out, fw_graph, joint_graph, *other_buffers]
+    # We have 5 dummy values but the start of other_buffers is at index 8
+    if graph_type == SubgraphType.JOINT_FWD:
+        return cnt + 3
+
+    # Same bwd args but now with 6 dummy values while other_buffers still start at 8
+    if graph_type == SubgraphType.JOINT_BWD:
+        return cnt + 2
+
+
 def build_subgraph_buffer(
     args: Tuple[IRNode],
     placeholder_inps: List[TensorBox],
     subgraph: Subgraph,
-    is_joint_graph: bool,
+    graph_type: SubgraphType,
 ) -> ComputedBuffer:
     """This function's goal is to take in the required args and produce the subgraph buffer
     The subgraph buffer is a ComputedBuffer that will be inlined into the triton template
@@ -70,7 +105,10 @@ def build_subgraph_buffer(
         # tuple and already have corresponding TensorBoxes passed in as args.
         if node.op == "placeholder":
             is_lifted_input = cnt >= len(placeholder_inps)
-            env[node] = args[cnt - 1] if is_lifted_input else placeholder_inps[cnt]
+            lifted_input_index = index_to_other_buffers(cnt, graph_type)
+            env[node] = (
+                args[lifted_input_index] if is_lifted_input else placeholder_inps[cnt]
+            )
             cnt += 1
         elif node.op == "call_function":
             # For call_function we use the default lowerings and pass in the
@@ -86,7 +124,10 @@ def build_subgraph_buffer(
             # The joint_graph's output should be of the form[grad_score, None, None, None, None]
             # This is because only the 'score' requires grad and the other outputs are
             # the non-differentiable index scalars
-            output_node = node.args[0] if not is_joint_graph else node.args[0][0]
+            if graph_type == SubgraphType.FWD or graph_type == SubgraphType.JOINT_FWD:
+                output_node = node.args[0]
+            else:
+                output_node = node.args[0][0]
             output_buffer = env[output_node]
             assert isinstance(output_buffer, TensorBox), (
                 "The output node  for flex attention's subgraph must be a TensorBox, but got: ",
@@ -323,7 +364,7 @@ def flex_attention(*args, **kwargs):
         ]
     ]
     subgraph_buffer = build_subgraph_buffer(
-        args, placeholder_inps, subgraph, is_joint_graph=False
+        args, placeholder_inps, subgraph, graph_type=SubgraphType.FWD
     )
     layout = FixedLayout(
         query.get_device(),
@@ -452,20 +493,20 @@ flex_attention_backward_template = TritonTemplate(
     DK += off_z * stride_kz + off_h * stride_kh
     DV += off_z * stride_vz + off_h * stride_vh
 
+    # TODO I think that this should be N_CTX/BLOCK_N blocks
     for start_n in range(0, NUM_Q_BLOCKS):
         # We are not doing the causal optimization yet allowing us to start further down the
         # kv column
-        offs_qm = tl.arange(0, BLOCK_M)
         offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
         offs_m = tl.arange(0, BLOCK_M)
         offs_k = tl.arange(0, BLOCK_DMODEL)
 
         # initialize pointers to value-like data
-        q_ptrs = Q + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        q_ptrs = Q + (offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk)
         k_ptrs = K + (offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk)
         v_ptrs = V + (offs_n[:, None] * stride_vn + offs_k[None, :] * stride_vk)
-        do_ptrs = DO + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
-        dq_ptrs = DQ + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        do_ptrs = DO + (offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        dq_ptrs = DQ + (offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk)
 
         # pointer to row-wise quantities in value-like data
         D_ptrs = DELTA + off_hz * N_CTX
@@ -492,9 +533,10 @@ flex_attention_backward_template = TritonTemplate(
             # -- compute qk ---
             qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
             qk = tl.dot(q, tl.trans(k.to(MATMUL_PRECISION)), acc=qk)
+            pre_mod_scores = qk
             # ~~~~~~~~~~~~~~~~~~~ Apply score modification  ~~~~~~~~~~~~~~~~~~~
             m = offs_m_curr[:, None]
-            n = start_n + offs_n[None, :]
+            n = offs_n[None, :]
             {{ modification(
                 subgraph_number=0,
                 score="qk",
@@ -517,16 +559,16 @@ flex_attention_backward_template = TritonTemplate(
 
             # compute dp = dot(v, do)
             Di = tl.load(D_ptrs + offs_m_curr) # [BLOCKM, 1]
-            dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) - Di[:, None]
-            dp += tl.dot(do, tl.trans(v))
 
             # compute ds = p * (dp - delta[:, None])
+            dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) - Di[:, None]
+            dp += tl.dot(do, tl.trans(v))
             ds = p * dp
 
             # ~~~~~~~~~~~~~~~~~~~ Apply joint modification  ~~~~~~~~~~~~~~~~~~~
             {{ modification(
                 subgraph_number=1,
-                score="qk",
+                score="pre_mod_scores",
                 b="off_z",
                 h="off_h",
                 m="m",
@@ -589,14 +631,14 @@ def flex_attention_backward(*args, **kwargs):
         ]
     ]
     fw_subgraph_buffer = build_subgraph_buffer(
-        args, fwd_placeholder_inps, fw_graph, is_joint_graph=False
+        args, fwd_placeholder_inps, fw_graph, graph_type=SubgraphType.JOINT_FWD
     )
 
     joint_placeholder_inps = fwd_placeholder_inps + [
         create_placeholder("out", dtype, device)
     ]
     joint_subgraph_buffer = build_subgraph_buffer(
-        args, joint_placeholder_inps, joint_graph, is_joint_graph=True
+        args, joint_placeholder_inps, joint_graph, graph_type=SubgraphType.JOINT_BWD
     )
 
     layout = FixedLayout(
@@ -621,16 +663,17 @@ def flex_attention_backward(*args, **kwargs):
 
     choices: List[Any] = []
     configs: List[Tuple[int, int, int, int]] = []
-    configs.append(_get_default_config(query))
-    if config.max_autotune:
-        configs += [
-            (128, 128, 4, 3),
-            (128, 128, 8, 2),
-            (64, 128, 4, 3),
-            (64, 64, 4, 3),
-        ]
-    configs = [(16, 16, 4, 1)]
-    # Note, we don't need to pass in the captured buffers explicitly
+    # TODO: Determine optimal config, I think this only works with square blocks right now
+    # configs.append(_get_default_config(query))
+    # if config.max_autotune:
+    #     configs += [
+    #         (128, 128, 4, 3),
+    #         (128, 128, 8, 2),
+    #         (64, 64, 4, 3),
+    #     ]
+    configs = [(64, 64, 4, 1)]
+    # Note, we don't need to pasc
+    # s in the captured buffers explicitly
     # because they're implicitly added by the score_mod function
     # We do need to explicitly pass it in for autotuning though.
     for BLOCK_M, BLOCK_N, num_warps, num_stages in configs:
