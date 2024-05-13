@@ -788,6 +788,7 @@ class FakeTensorTest(TestCase):
             grad_out = torch.rand(2, 3, 4, 4)
             inp = torch.rand(2, 3, 4, 4).to(memory_format=torch.channels_last)
             grad_in = torch.ops.aten._adaptive_avg_pool2d_backward(grad_out, inp)
+            print("debug 2d print channels last", torch._prims_common.suggest_memory_format(grad_in), torch.channels_last_3d)
             self.assertTrue(torch._prims_common.suggest_memory_format(grad_in) == torch.channels_last)
 
     def test__adaptive_avg_pool3d_backward(self):
@@ -795,7 +796,7 @@ class FakeTensorTest(TestCase):
             grad_out = torch.rand(2, 3, 4, 4, 4)
             inp = torch.rand(2, 3, 4, 4, 4).to(memory_format=torch.channels_last_3d)
             grad_in = torch.ops.aten._adaptive_avg_pool3d_backward(grad_out, inp)
-            print("debug print channels last", torch._prims_common.suggest_memory_format(grad_in), torch.channels_last_3d)
+            print("debug 3d print channels last", torch._prims_common.suggest_memory_format(grad_in), torch.channels_last_3d)
             self.assertTrue(torch._prims_common.suggest_memory_format(grad_in) == torch.channels_last_3d)
 
     # Propagate real tensors doesn't work when original input arguments are
