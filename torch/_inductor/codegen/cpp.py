@@ -3799,8 +3799,14 @@ class CppScheduling(BaseScheduling):
                 cpp_kernel_proxy_list.append(cpp_kernel_proxy)
                 nodes_list.append(_node.get_nodes())  # type: ignore[arg-type]
 
-            if not node.check_outer_fusion_loop_level_attr(
-                cpp_kernel_proxy_list, node.outer_loop_fusion_depth
+            if not (
+                node.check_outer_fusion_loop_level_attr(
+                    cpp_kernel_proxy_list, node.outer_loop_fusion_depth
+                )
+                # In the typical case, the local buffer should be corresponding to an output buffer,
+                # which stores with temp values at first before loading later.
+                and local_buffers[0].original_node_name
+                in kernel_group.args.output_buffers
             ):
                 return False
             metrics.cpp_outer_loop_fused_inner_counts.append(
@@ -3816,6 +3822,10 @@ class CppScheduling(BaseScheduling):
                 outer_fusion_cpp_kernel_proxy,
                 [_node for _nodes in nodes_list for _node in _nodes],
             )
+
+            # Remove the node from kernel group args, since using local buffer now
+            kernel_group.skip_arg = local_buffers[0].original_node_name
+
             return True
 
         if not try_outer_loop_fusion_with_local_buf(node):
@@ -3938,6 +3948,7 @@ class KernelGroup:
         self.stack = contextlib.ExitStack()
         self.stack.enter_context(self.ws)
         self.scheduled_nodes = []
+        self.skip_arg = None
 
     def new_kernel(self, cls, *args):
         return cls(self.args, parallel_num_threads(), *args)
@@ -3970,6 +3981,10 @@ class KernelGroup:
         # 2. Function definition
         kernel_decl_name = str(Placeholder.KERNEL_NAME) if name is None else name
         kernel_name = str(Placeholder.DESCRIPTIVE_NAME) if name is None else name
+
+        if self.skip_arg is not None:
+            self.args.output_buffers.pop(self.skip_arg)
+
         arg_defs, _, _ = self.args.cpp_argdefs()
         arg_defs = ",\n".ljust(25).join(arg_defs)
         code.writeline(f'extern "C" void {kernel_decl_name}({arg_defs})')
