@@ -1812,7 +1812,7 @@ def are_strides_like_channels_last(
     shape: Sequence[int], strides: Sequence[int]
 ) -> bool:
     ndim = len(shape)
-
+    print("DEBUG, are_strides_like_channels_last, ndim", ndim)
     if ndim == 4:
         # Check for channels_last_2d
         dim_order = [1, 3, 2, 0]
@@ -1822,6 +1822,8 @@ def are_strides_like_channels_last(
     else:
         return False
 
+    print("DEBUG, are_strides_like_channels_last, strides", strides)
+    print("DEBUG, are_strides_like_channels_last, shape", shape)
     if strides[1] == 0:
         return False
 
@@ -1841,6 +1843,7 @@ def are_strides_like_channels_last(
 
 def suggest_memory_format(x: TensorLikeType) -> torch.memory_format:
     if x.layout != torch.strided:
+        print("DEBUG, suggest_memory_format layout not stried")
         return torch.contiguous_format
 
     if are_strides_like_channels_last(x.shape, x.stride()):
@@ -1892,7 +1895,7 @@ def get_aten_op(fn: Callable, name: str):
     module = fn.__module__
     prefix = "torch._refs"
     assert module.startswith(prefix)
-    module = module[len(prefix) :]
+    module = module[len(prefix):]
     # We want to go from .special / .nn.functional
     # to special and special_ / nn_functional_
     if module:
